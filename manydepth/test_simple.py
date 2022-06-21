@@ -15,16 +15,17 @@ import matplotlib.cm as cm
 import torch
 from torchvision import transforms
 
-from manydepth import networks
+from . import networks
 from .layers import transformation_from_parameters
 
+if torch.cuda.is_available():
+    device = 'cuda'
+else:
+    device = 'cpu'
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Simple testing funtion for ManyDepth models.')
-
-    parser.add_argument('--target_image_path', type=str,
-                        help='path to a test image to predict for', required=True)
     parser.add_argument('--source_image_path', type=str,
                         help='path to a previous image in the video sequence', required=True)
     parser.add_argument('--intrinsics_json_path', type=str,
@@ -38,16 +39,19 @@ def parse_args():
                         required=False)
     return parser.parse_args()
 
-
 def load_and_preprocess_image(image_path, resize_width, resize_height):
-    image = pil.open(image_path).convert('RGB')
+
+    try:
+        image = pil.open(image_path).convert('RGB')
+    except OSError:
+        raise OSError
+
     original_width, original_height = image.size
     image = image.resize((resize_width, resize_height), pil.LANCZOS)
     image = transforms.ToTensor()(image).unsqueeze(0)
     if torch.cuda.is_available():
         return image.cuda(), (original_height, original_width)
     return image, (original_height, original_width)
-
 
 def load_and_preprocess_intrinsics(intrinsics_path, resize_width, resize_height):
     K = np.eye(4)
@@ -66,19 +70,15 @@ def load_and_preprocess_intrinsics(intrinsics_path, resize_width, resize_height)
         return K.cuda(), invK.cuda()
     return K, invK
 
-
-def test_simple(args):
+def test_simple(model_path, mode, intrinsics_json_path, target_image_path):
     """Function to predict for a single image or folder of images
     """
-    assert args.model_path is not None, \
+    assert model_path is not None, \
         "You must specify the --model_path parameter"
-
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    print("-> Loading model from ", args.model_path)
 
     # Loading pretrained model
     print("   Loading pretrained encoder")
-    encoder_dict = torch.load(os.path.join(args.model_path, "encoder.pth"), map_location=device)
+    encoder_dict = torch.load(os.path.join(model_path, "encoder.pth"), map_location=device)
     encoder = networks.ResnetEncoderMatching(18, False,
                                              input_width=encoder_dict['width'],
                                              input_height=encoder_dict['height'],
@@ -94,13 +94,13 @@ def test_simple(args):
     print("   Loading pretrained decoder")
     depth_decoder = networks.DepthDecoder(num_ch_enc=encoder.num_ch_enc, scales=range(4))
 
-    loaded_dict = torch.load(os.path.join(args.model_path, "depth.pth"), map_location=device)
+    loaded_dict = torch.load(os.path.join(model_path, "depth.pth"), map_location=device)
     depth_decoder.load_state_dict(loaded_dict)
 
     print("   Loading pose network")
-    pose_enc_dict = torch.load(os.path.join(args.model_path, "pose_encoder.pth"),
+    pose_enc_dict = torch.load(os.path.join(model_path, "pose_encoder.pth"),
                                map_location=device)
-    pose_dec_dict = torch.load(os.path.join(args.model_path, "pose.pth"), map_location=device)
+    pose_dec_dict = torch.load(os.path.join(model_path, "pose.pth"), map_location=device)
 
     pose_enc = networks.ResnetEncoder(18, False, num_input_images=2)
     pose_dec = networks.PoseDecoder(pose_enc.num_ch_enc, num_input_features=1,
@@ -121,15 +121,22 @@ def test_simple(args):
         pose_dec.cuda()
 
     # Load input data
-    input_image, original_size = load_and_preprocess_image(args.target_image_path,
-                                                           resize_width=encoder_dict['width'],
-                                                           resize_height=encoder_dict['height'])
+    try:
+        input_image, original_size = load_and_preprocess_image(
+            target_image_path,
+            resize_width=encoder_dict['width'],
+            resize_height=encoder_dict['height']
+        )
+    except OSError:
+        raise OSError
 
-    source_image, _ = load_and_preprocess_image(args.source_image_path,
+
+    # Source image is ignored, for now we just load the target as a dummy
+    source_image, _ = load_and_preprocess_image(target_image_path,
                                                 resize_width=encoder_dict['width'],
                                                 resize_height=encoder_dict['height'])
 
-    K, invK = load_and_preprocess_intrinsics(args.intrinsics_json_path,
+    K, invK = load_and_preprocess_intrinsics(intrinsics_json_path,
                                              resize_width=encoder_dict['width'],
                                              resize_height=encoder_dict['height'])
 
@@ -141,7 +148,7 @@ def test_simple(args):
         axisangle, translation = pose_dec(pose_inputs)
         pose = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=True)
 
-        if args.mode == 'mono':
+        if mode == 'mono':
             pose *= 0  # zero poses are a signal to the encoder not to construct a cost volume
             source_image *= 0
 
@@ -161,28 +168,7 @@ def test_simple(args):
             sigmoid_output, original_size, mode="bilinear", align_corners=False)
         sigmoid_output_resized = sigmoid_output_resized.cpu().numpy()[:, 0]
 
-        # Saving numpy file
-        directory, filename = os.path.split(args.target_image_path)
-        output_name = os.path.splitext(filename)[0]
-        name_dest_npy = os.path.join(directory, "{}_disp_{}.npy".format(output_name, args.mode))
-        np.save(name_dest_npy, sigmoid_output.cpu().numpy())
-
-        # Saving colormapped depth image and cost volume argmin
-        for plot_name, toplot in (('costvol_min', lowest_cost), ('disp', sigmoid_output_resized)):
-            toplot = toplot.squeeze()
-            normalizer = mpl.colors.Normalize(vmin=toplot.min(), vmax=np.percentile(toplot, 95))
-            mapper = cm.ScalarMappable(norm=normalizer, cmap='magma')
-            colormapped_im = (mapper.to_rgba(toplot)[:, :, :3] * 255).astype(np.uint8)
-            im = pil.fromarray(colormapped_im)
-
-            name_dest_im = os.path.join(directory,
-                                        "{}_{}_{}.jpeg".format(output_name, plot_name, args.mode))
-            im.save(name_dest_im)
-
-            print("-> Saved output image to {}".format(name_dest_im))
-
-    print('-> Done!')
-
+        return sigmoid_output.cpu().numpy()
 
 if __name__ == '__main__':
     args = parse_args()
